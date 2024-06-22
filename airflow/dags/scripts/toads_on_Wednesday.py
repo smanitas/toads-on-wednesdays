@@ -1,8 +1,12 @@
 import json
 import logging
+from io import BytesIO
 
 import pymsteams
 import requests
+from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
 from airflow.hooks.base import BaseHook
 from airflow.models import Variable
 
@@ -33,17 +37,60 @@ def _load_image(ti):
         logging.exception(f"Error loading image: {e}")
 
 
-def _send_to_teams(**kwargs):
+def _create_content_image(ti):
+    image_url = ti.xcom_pull(task_ids="load_image", key="image_url")
+
+    response = requests.get(image_url)
+    image = Image.open(BytesIO(response.content)).convert("RGBA")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.truetype(FONT_PATH, size=20)
+
+    # putting the text in the center of the image
+    text_width, text_height = draw.textsize(PHRASE, font=font)
+    horizontal_position = (image.width - text_width) // 2
+    vertical_position = (image.height - text_height) // 15
+
+    # drawing a background rectangle
+    bbox = draw.textbbox((horizontal_position, vertical_position), PHRASE, font=font)
+    draw.rectangle(bbox, fill="yellow")
+    draw.text((horizontal_position, vertical_position), PHRASE, font=font, fill="green")
+
+    image_io = BytesIO()
+    image.convert("RGB").save(image_io, format="PNG")
+    image_io.seek(0)
+    freeimage_url = _upload_image_to_freeimage(image_io)
+
+    logging.info("Content is created")
+    ti.xcom_push(key="updated_image_url", value=freeimage_url)
+
+
+def _upload_image_to_freeimage(image_io):
+    freeimage_conn = BaseHook.get_connection("FREEIMAGE_API")
+    freeimage_key = json.loads(freeimage_conn.extra)["api_key"]
+
+    url = "https://freeimage.host/api/1/upload"
+    files = {"source": ("image.png", image_io, "image/png")}
+    data = {"key": freeimage_key, "action": "upload"}
+    response = requests.post(url, files=files, data=data)
+
+    if response.status_code == 200:
+        response_json = response.json()
+        logging.info(f"FreeImage response: {response_json}")
+        return response_json.get("image", {}).get("url")
+    else:
+        logging.error(
+            f"Failed to upload image to FreeImage. Status code: {response.status_code}"
+        )
+        return None
+
+
+def _send_to_teams(ti):
     teams_conn = BaseHook.get_connection("TEAMS_WEBHOOK")
     webhook_url = teams_conn.host
 
-    ti = kwargs["ti"]
-    image_url = ti.xcom_pull(task_ids="load_image", key="image_url")
-    logging.debug(f"Using SENDER_NAME: {SENDER_NAME}")
-
+    image_url = ti.xcom_pull(task_ids="create_content_image", key="updated_image_url")
     content = (
         f"Sent by {SENDER_NAME}\n\n"
-         f"{PHRASE}\n\n"
         f"![Image]({image_url})"
     )
 
@@ -56,8 +103,10 @@ def _send_to_teams(**kwargs):
         logging.exception(f"Failed to send content to Teams due to webhook error: {e}")
         raise
     except requests.RequestException as e:
-        logging.exception(f"Failed to send content to Teams due to network connectivity issue: {e}")
+        logging.exception(
+            f"Failed to send content to Teams due to network connectivity issue: {e}")
         raise
     except Exception as e:
-        logging.exception(f"An unexpected error occurred while sending content to Teams: {e}")
+        logging.exception(
+            f"An unexpected error occurred while sending content to Teams: {e}")
         raise
